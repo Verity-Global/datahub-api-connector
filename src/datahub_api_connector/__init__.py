@@ -7,6 +7,8 @@ import datetime as dt
 import logging
 from time import sleep
 import concurrent.futures
+import threading
+
 
 DEFAULT_API_URL = 'https://api.opinum.com'
 DEFAULT_AUTH_URL = 'https://auth.opinum.com'
@@ -25,13 +27,17 @@ class ApiConnector:
 
     time_limit = 3 * 60  # Three minutes
 
+    DEFAULT_REQUEST_TIMEOUT = 10  # seconds
     MAX_RETRIES_WHEN_CONNECTION_FAILURE = 5
 
     def __init__(self,
                  environment=None,
                  account_id=None,
                  retries_when_connection_failure=0,
-                 seconds_between_retries=5):
+                 seconds_between_retries=5, request_timeout=DEFAULT_REQUEST_TIMEOUT, log_level="INFO"):
+        logging.basicConfig()
+        logging.root.setLevel(log_level)
+        
         self.environment = os.environ if environment is None else environment
         self.api_url = self.environment.get('DATAHUB_API_URL', self.environment.get('OPINUM_API_URL', DEFAULT_API_URL))
         self.auth_url = f"{self.environment.get('DATAHUB_AUTH_URL', self.environment.get('OPINUM_AUTH_URL', DEFAULT_AUTH_URL))}/realms/opinum/protocol/openid-connect/token"
@@ -44,25 +50,28 @@ class ApiConnector:
         self.account_id = account_id
         self.creation_time = None
         self.token = None
-        self._set_token()
+        self.request_timeout = request_timeout if request_timeout and request_timeout > 0 else self.DEFAULT_REQUEST_TIMEOUT
         self.max_call_attempts = 1 + min(retries_when_connection_failure, self.MAX_RETRIES_WHEN_CONNECTION_FAILURE)
         self.seconds_between_retries = seconds_between_retries
+        self._token_lock = threading.Lock()
+        self._set_token()
 
     def _set_token(self):
-        oauth = OAuth2Session(client=LegacyApplicationClient(client_id=self.client_id))
-        args = {
-            'token_url': f"{self.auth_url}",
-            'scope': self.scope,
-            'username': self.username,
-            'password': self.password,
-            'client_id': self.client_id,
-            'client_secret': self.client_secret,
-            'auth': None
-        }
-        if self.account_id is not None:
-            args['account'] = self.account_id
-        self.token = oauth.fetch_token(**args)
-        self.creation_time = dt.datetime.now()
+        with self._token_lock:
+            oauth = OAuth2Session(client=LegacyApplicationClient(client_id=self.client_id))
+            args = {
+                'token_url': f"{self.auth_url}",
+                'scope': self.scope,
+                'username': self.username,
+                'password': self.password,
+                'client_id': self.client_id,
+                'client_secret': self.client_secret,
+                'auth': None
+            }
+            if self.account_id is not None:
+                args['account'] = self.account_id
+            self.token = oauth.fetch_token(**args, timeout=self.request_timeout)
+            self.creation_time = dt.datetime.now()
 
     @property
     def _headers(self):
@@ -74,6 +83,7 @@ class ApiConnector:
     def _process_request(self, method, url, data, **kwargs):
         attempts = 0
         error = Exception('Unknown exception')
+        request_headers = self._headers
         while attempts < self.max_call_attempts:
             try:
                 if data is not None:
@@ -84,9 +94,16 @@ class ApiConnector:
                         v = v.strftime('%Y-%m-%dT%H:%M:%S')
                     if k == 'date_from':
                         k = 'from'
-                    params[k] = v
 
-                response = method(url, data=data, params=params, headers=self._headers)
+                    # some requests can be used to count items, which must be added into the header
+                    # in that case, we don't want to add it as a parameter
+                    if k == 'IncludeItemsCount':
+                        if v:
+                            request_headers['x-total-count'] = "true"
+                    else:
+                        params[k] = v
+
+                response = method(url, data=data, params=params, headers=request_headers, timeout=self.request_timeout)
                 response.raise_for_status()
                 return response
             except (requests.exceptions.ConnectionError, AssertionError) as e:
@@ -169,16 +186,17 @@ class ApiConnector:
                                      data=data,
                                      **kwargs)
 
-    def push_data(self, body, operation_id: str=None):
+    def push_data(self, body, operation_id: str=None, operation_timeout_sec: int=None):
         """
         Method for data push in the API
 
         :param body: see https://docs.opinum.com/articles/push-formats/standard-format.html
         :param operation_id: a string representing the operationId of the push; see https://docs.opinum.com/articles/push-formats/standard-format.html#ask-for-a-webhook-notification
+        :param operation_timeout_sec: timeout value in seconds for the push operation (default: 60s); see https://docs.opinum.com/articles/push-formats/standard-format.html#ask-for-a-webhook-notification
         :return: the http request response
         """
         return self._process_request(requests.post,
-                                     self.push_url+("?"+str(operation_id) if operation_id is not None else ""),
+                                     self.push_url+("?operationId="+str(operation_id) if operation_id is not None else "")+("?operationTimeoutSec="+str(operation_timeout_sec) if operation_timeout_sec is not None else ""),
                                      body)
 
     def push_dataframe_data(self, df, **kwargs):

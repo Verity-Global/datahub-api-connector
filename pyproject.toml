@@ -1,3 +1,32 @@
 [build-system]
-requires = ['setuptools>=42']
+requires = ['setuptools>= 77.0.3']
 build-backend = 'setuptools.build_meta'
+
+[project]
+name = "datahub-api-connector"
+version = "1.2"
+dependencies = [
+    "requests",
+    "requests_oauthlib",
+    "oauthlib"
+]
+requires-python = ">=3.10"
+authors = [
+  {name = "Verity", email = "support@verity.global"}
+]
+maintainers = [
+  {name = "Verity", email = "support@verity.global"}
+]
+description = "Package to help connect to Verity's Data Hub API"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["datahub", "Data Hub", "Verity", "Opinum", "API", "Keycloak"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Programming Language :: Python"
+]
+
+[project.urls]
+Homepage = "https://github.com/opinum/datahub-api-connector"
+"Bug Tracker" = "https://github.com/opinum/datahub-api-connector/issues"
