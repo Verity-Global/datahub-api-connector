@@ -1,4 +1,10 @@
 from src.datahub_api_connector import ApiConnector as api
+from io import BytesIO
+
+# send to storage example
+# content = BytesIO(b"Test")
+# ret = api(account_id=920).send_file_to_storage(filename="test_smo.txt", file_io=content, mime_type="text/csv")
+# print(ret)
 
 # GET sources examples (with and without count)
 # response = api(account_id=920, request_timeout=5, log_level="INFO").get('sources', DisplayLevel='Light', IncludeItemsCount=True)
