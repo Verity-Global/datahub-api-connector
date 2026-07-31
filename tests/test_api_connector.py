@@ -7,6 +7,7 @@ constructor, so the OAuth2Session mock is needed by every test.
 """
 import datetime as dt
 import json
+import logging
 import threading
 from unittest import mock
 
@@ -32,8 +33,10 @@ def make_token(expires_in=3600, access_token='access-0', refresh_token='refresh-
 
 
 class FakeResponse:
-    def __init__(self, status_code=200):
+    def __init__(self, status_code=200, text='', headers=None):
         self.status_code = status_code
+        self.text = text
+        self.headers = headers or dict()
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -65,8 +68,11 @@ def oauth_session():
 
 @pytest.fixture
 def no_sleep(monkeypatch):
+    """Records the waits instead of serving them, and drops the backoff jitter
+    so the recorded durations are predictable."""
     sleeps = list()
     monkeypatch.setattr(dac, 'sleep', sleeps.append)
+    monkeypatch.setattr(dac.random, 'uniform', lambda low, high: 0.0)
     return sleeps
 
 
@@ -76,10 +82,15 @@ def connector(oauth_session):
         yield instance
 
 
-def test_body_is_serialized_once_across_retries(oauth_session, no_sleep):
+@pytest.mark.parametrize('first_outcome', [requests.exceptions.ConnectionError('boom'),
+                                           FakeResponse(500)],
+                         ids=['connection_error', 'server_error'])
+def test_body_is_serialized_once_across_retries(oauth_session, no_sleep, first_outcome):
     """A retried call used to re-encode an already-JSON body, producing a 400."""
-    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=1)
-    recorder = Recorder([requests.exceptions.ConnectionError('boom'), FakeResponse()])
+    connector = ApiConnector(environment=ENVIRONMENT,
+                             retries_when_connection_failure=1,
+                             retry_unsafe_methods=True)
+    recorder = Recorder([first_outcome, FakeResponse()])
     connector._session.post = recorder
 
     body = [{'variableId': 7, 'data': [{'date': '2026-07-30T00:00:00Z', 'value': 1.5}]}]
@@ -103,8 +114,8 @@ def test_attempts_and_waits_are_accounted(oauth_session, no_sleep):
         connector.get('sources')
 
     assert len(recorder.calls) == 3
-    # No wait after the last failed attempt.
-    assert no_sleep == [3, 3]
+    # Doubling between attempts, and no wait after the last failed one.
+    assert no_sleep == [3, 6]
 
 
 def test_read_timeout_is_retried(oauth_session, no_sleep):
@@ -117,14 +128,183 @@ def test_read_timeout_is_retried(oauth_session, no_sleep):
     assert len(recorder.calls) == 2
 
 
-def test_http_error_is_not_retried(connector):
-    recorder = Recorder([FakeResponse(404), FakeResponse()])
+def test_server_error_is_retried_on_get(oauth_session, no_sleep):
+    """A transient 500 used to abort the call: HTTPError was in no except clause."""
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=1)
+    recorder = Recorder([FakeResponse(500), FakeResponse()])
+    connector._session.get = recorder
+
+    assert connector.get('sources').status_code == 200
+    assert len(recorder.calls) == 2
+
+
+def test_server_error_raises_once_the_retries_are_exhausted(oauth_session, no_sleep):
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=1)
+    recorder = Recorder([FakeResponse(500), FakeResponse(503)])
+    connector._session.get = recorder
+
+    with pytest.raises(requests.exceptions.HTTPError) as raised:
+        connector.get('sources')
+
+    assert raised.value.response.status_code == 503
+    assert len(recorder.calls) == 2
+
+
+@pytest.mark.parametrize('status', [400, 401, 403, 404, 409, 501])
+def test_client_error_and_permanent_failure_are_not_retried(oauth_session, no_sleep, status):
+    """They would fail identically on a second attempt. 501 is permanent too."""
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=3)
+    recorder = Recorder([FakeResponse(status), FakeResponse()])
     connector._session.get = recorder
 
     with pytest.raises(requests.exceptions.HTTPError):
         connector.get('sources')
 
     assert len(recorder.calls) == 1
+    assert no_sleep == list()
+
+
+def test_server_error_is_not_retried_on_post_by_default(oauth_session, no_sleep):
+    """Replaying a write the server may already have applied would duplicate it."""
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=3)
+    recorder = Recorder([FakeResponse(500), FakeResponse()])
+    connector._session.post = recorder
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        connector.post('sources', data={'name': 'a source'})
+
+    assert len(recorder.calls) == 1
+
+
+def test_server_error_is_retried_on_post_when_opted_in(oauth_session, no_sleep):
+    """For callers whose POST only reads, such as the query-by-body POST /data."""
+    connector = ApiConnector(environment=ENVIRONMENT,
+                             retries_when_connection_failure=1,
+                             retry_unsafe_methods=True)
+    recorder = Recorder([FakeResponse(500), FakeResponse()])
+    connector._session.post = recorder
+
+    assert connector.post('data', data={'VariableIds': [1]}).status_code == 200
+    assert len(recorder.calls) == 2
+
+
+def test_retry_on_status_can_be_narrowed(oauth_session, no_sleep):
+    connector = ApiConnector(environment=ENVIRONMENT,
+                             retries_when_connection_failure=3,
+                             retry_on_status={503})
+    recorder = Recorder([FakeResponse(500), FakeResponse()])
+    connector._session.get = recorder
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        connector.get('sources')
+
+    assert len(recorder.calls) == 1
+
+
+def test_retry_on_status_can_be_disabled(oauth_session, no_sleep):
+    """Restores the pre-1.4 behaviour for a caller that wants it."""
+    connector = ApiConnector(environment=ENVIRONMENT,
+                             retries_when_connection_failure=3,
+                             retry_on_status=None)
+    recorder = Recorder([FakeResponse(500), FakeResponse()])
+    connector._session.get = recorder
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        connector.get('sources')
+
+    assert len(recorder.calls) == 1
+
+
+def test_backoff_grows_and_is_capped(oauth_session, no_sleep):
+    connector = ApiConnector(environment=ENVIRONMENT,
+                             retries_when_connection_failure=5,
+                             seconds_between_retries=10)
+    connector._session.get = Recorder([FakeResponse(500)] * 6)
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        connector.get('sources')
+
+    assert no_sleep == [10, 20, 40, dac.MAX_BACKOFF_SECONDS, dac.MAX_BACKOFF_SECONDS]
+
+
+def test_backoff_is_jittered(oauth_session, monkeypatch):
+    """Without jitter, every thread sharing a connector retries in lockstep."""
+    sleeps = list()
+    monkeypatch.setattr(dac, 'sleep', sleeps.append)
+    connector = ApiConnector(environment=ENVIRONMENT,
+                             retries_when_connection_failure=1,
+                             seconds_between_retries=4)
+    connector._session.get = Recorder([FakeResponse(500), FakeResponse()])
+
+    connector.get('sources')
+
+    assert 4 <= sleeps[0] <= 5
+
+
+def test_retry_after_takes_precedence_over_the_backoff(oauth_session, no_sleep):
+    connector = ApiConnector(environment=ENVIRONMENT,
+                             retries_when_connection_failure=1,
+                             seconds_between_retries=30)
+    connector._session.get = Recorder([FakeResponse(429, headers={'Retry-After': '2'}),
+                                       FakeResponse()])
+
+    connector.get('sources')
+
+    assert no_sleep == [2]
+
+
+def test_retry_after_is_capped_and_a_http_date_is_ignored(oauth_session, no_sleep):
+    connector = ApiConnector(environment=ENVIRONMENT,
+                             retries_when_connection_failure=2,
+                             seconds_between_retries=1)
+    connector._session.get = Recorder([
+        FakeResponse(503, headers={'Retry-After': '99999'}),
+        FakeResponse(503, headers={'Retry-After': 'Wed, 30 Jul 2026 04:00:00 GMT'}),
+        FakeResponse(),
+    ])
+
+    connector.get('sources')
+
+    # Second wait falls back to the exponential backoff of attempt 2.
+    assert no_sleep == [dac.MAX_BACKOFF_SECONDS, 2]
+
+
+def test_response_body_is_logged_on_server_error(oauth_session, no_sleep, caplog):
+    """raise_for_status() drops the body, which is where the API states the cause."""
+    connector = ApiConnector(environment=ENVIRONMENT,
+                             retries_when_connection_failure=1,
+                             retry_unsafe_methods=True)
+    body = '{"message":"No grpc-status found on response."}'
+    connector._session.post = Recorder([FakeResponse(500, text=body), FakeResponse()])
+
+    with caplog.at_level('WARNING', logger='datahub_api_connector'):
+        connector.post('data', data={'VariableIds': [1]})
+
+    logged = caplog.text
+    assert 'No grpc-status found on response.' in logged
+    assert 'HTTP 500 on POST https://api.opinum.com/data' in logged
+
+
+def test_a_long_response_body_is_truncated_in_the_logs(oauth_session, no_sleep, caplog):
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=0)
+    connector._session.get = Recorder([FakeResponse(500, text='x' * 5000)])
+
+    with caplog.at_level('ERROR', logger='datahub_api_connector'):
+        with pytest.raises(requests.exceptions.HTTPError):
+            connector.get('sources')
+
+    assert 'x' * dac.RESPONSE_BODY_LOG_LENGTH + '...' in caplog.text
+    assert 'x' * (dac.RESPONSE_BODY_LOG_LENGTH + 1) not in caplog.text
+
+
+def test_the_root_logger_is_left_alone(oauth_session):
+    """Configuring root reset the level of an application that had already set it."""
+    logging.root.setLevel(logging.WARNING)
+
+    ApiConnector(environment=ENVIRONMENT, log_level='DEBUG')
+
+    assert logging.root.level == logging.WARNING
+    assert logging.getLogger('datahub_api_connector').level == logging.DEBUG
 
 
 def test_headers_are_rebuilt_on_each_attempt(oauth_session, no_sleep):

@@ -6,10 +6,13 @@ import requests
 from requests.adapters import HTTPAdapter
 import datetime as dt
 import logging
+import random
 from time import sleep
 import concurrent.futures
 import threading
 
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = 'https://api.opinum.com'
 DEFAULT_AUTH_URL = 'https://auth.opinum.com'
@@ -20,6 +23,21 @@ DEFAULT_PUSH_URL = 'https://push.opinum.com'
 # response) so a request can't start with a token that expires mid-flight.
 TOKEN_EXPIRY_MARGIN = 120
 
+# Statuses worth retrying: the server told us it failed, but a later attempt may
+# well succeed. 501 (Not Implemented) is deliberately absent, it is permanent.
+DEFAULT_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+# Upper bound on the exponential backoff between two attempts.
+MAX_BACKOFF_SECONDS = 60
+
+# Number of characters of the response body kept in the retry/failure logs. The
+# API puts the actual reason there (e.g. the gRPC detail behind a 500), which
+# raise_for_status() does not include in its message.
+RESPONSE_BODY_LOG_LENGTH = 200
+
+# Methods that can be replayed without risk of applying a change twice.
+IDEMPOTENT_VERBS = frozenset({'get'})
+
 
 class ApiConnector:
     """
@@ -28,6 +46,8 @@ class ApiConnector:
     :param environment: a dictionary with all environment variables
     :param account_id: the account id to use (for users having access to multiple tenants)
     :param retries_when_connection_failure: allows to make several attempts to have a successful query (connection issues can happen)
+    :param retry_on_status: HTTP statuses that are retried instead of raised immediately
+    :param retry_unsafe_methods: also retry those statuses on POST/PUT/PATCH/DELETE, not only on GET
     """
 
     DEFAULT_REQUEST_TIMEOUT = 10  # seconds
@@ -43,9 +63,13 @@ class ApiConnector:
                  account_id=None,
                  retries_when_connection_failure=0,
                  seconds_between_retries=5, request_timeout=DEFAULT_REQUEST_TIMEOUT, log_level="INFO",
-                 pool_size=DEFAULT_POOL_SIZE):
-        logging.basicConfig()
-        logging.root.setLevel(log_level)
+                 pool_size=DEFAULT_POOL_SIZE,
+                 retry_on_status=DEFAULT_RETRY_STATUSES,
+                 retry_unsafe_methods=False):
+        # Only this package's logger is configured. Calling logging.basicConfig()
+        # and logging.root.setLevel() reset the level of an application that had
+        # already configured logging itself before building an ApiConnector.
+        logger.setLevel(log_level)
 
         self.environment = os.environ if environment is None else environment
         self.api_url = self.environment.get('DATAHUB_API_URL', self.environment.get('OPINUM_API_URL', DEFAULT_API_URL))
@@ -61,6 +85,8 @@ class ApiConnector:
         self.request_timeout = request_timeout if request_timeout and request_timeout > 0 else self.DEFAULT_REQUEST_TIMEOUT
         self.max_call_attempts = 1 + min(retries_when_connection_failure, self.MAX_RETRIES_WHEN_CONNECTION_FAILURE)
         self.seconds_between_retries = seconds_between_retries
+        self.retry_on_status = frozenset(retry_on_status or ())
+        self.retry_unsafe_methods = retry_unsafe_methods
         self._token_lock = threading.Lock()
 
         # Persistent session with a bounded, blocking connection pool. Without it
@@ -123,7 +149,7 @@ class ApiConnector:
                     self._refresh_token()
                     return
                 except Exception:
-                    logging.warning("Token refresh failed, falling back to a full reissue", exc_info=True)
+                    logger.warning("Token refresh failed, falling back to a full reissue", exc_info=True)
             self._set_token()
 
     @property
@@ -132,7 +158,55 @@ class ApiConnector:
         return {"Content-Type": "application/json",
                 "Authorization": f"Bearer {self.token['access_token']}"}
 
-    def _process_request(self, method, url, data, **kwargs):
+    def _backoff_delay(self, attempt, response=None):
+        """
+        Seconds to wait before the next attempt: exponential, capped, with jitter.
+
+        A fixed delay made all the threads sharing a connector retry in lockstep
+        after a common upstream hiccup, which hit the recovering service with the
+        very same burst that had just failed. The jitter spreads them out.
+        A Retry-After given by the server takes precedence.
+        """
+        retry_after = self._retry_after_seconds(response)
+        if retry_after is not None:
+            return min(retry_after, MAX_BACKOFF_SECONDS)
+        delay = min(self.seconds_between_retries * 2 ** (attempt - 1), MAX_BACKOFF_SECONDS)
+        return delay + random.uniform(0, delay * 0.25)
+
+    @staticmethod
+    def _retry_after_seconds(response):
+        """Retry-After in its delay-seconds form; None when absent or a HTTP date."""
+        if response is None:
+            return None
+        raw = getattr(response, 'headers', None) or {}
+        try:
+            return max(0.0, float(raw.get('Retry-After')))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _body_snippet(response):
+        """Beginning of the response body, for logging. Never raises."""
+        try:
+            text = response.text or ''
+        except Exception:
+            return ''
+        text = ' '.join(text.split())
+        if len(text) > RESPONSE_BODY_LOG_LENGTH:
+            return f"{text[:RESPONSE_BODY_LOG_LENGTH]}..."
+        return text
+
+    def _is_retryable_status(self, verb, response):
+        # An HTTPError raised without a response carries no status to judge on.
+        if response is None or getattr(response, 'status_code', None) not in self.retry_on_status:
+            return False
+        # Replaying a POST/PUT/PATCH/DELETE that the server may have already
+        # applied before failing would duplicate the change, so those need an
+        # explicit opt-in. It is safe for calls that only read, such as the
+        # query-by-body POST /data.
+        return self.retry_unsafe_methods or verb in IDEMPOTENT_VERBS
+
+    def _process_request(self, method, url, data, verb='get', **kwargs):
         # The body is serialized once, outside the retry loop. Serializing it
         # inside meant a retried call re-encoded an already-JSON string and sent
         # a doubly-encoded body, which the API rejects with a 400.
@@ -154,6 +228,7 @@ class ApiConnector:
                 params[k] = v
 
         error = Exception('Unknown exception')
+        failure = str(error)
         for attempt in range(1, self.max_call_attempts + 1):
             try:
                 # Headers are rebuilt on every attempt so that a token renewed
@@ -166,14 +241,28 @@ class ApiConnector:
                                   headers=request_headers, timeout=self.request_timeout)
                 response.raise_for_status()
                 return response
+            except requests.exceptions.HTTPError as e:
+                # raise_for_status() turns any 4xx/5xx into an HTTPError. A status
+                # the server may recover from is retried; anything else (400, 401,
+                # 404, ...) would fail again identically, so it is raised at once.
+                response = e.response
+                if not self._is_retryable_status(verb, response):
+                    raise
+                error = e
+                failure = (f"HTTP {response.status_code} on {verb.upper()} {url}"
+                           f" - {self._body_snippet(response)}")
+                delay = self._backoff_delay(attempt, response)
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout,
                     AssertionError) as e:
                 error = e
-                logging.warning(f"Failure {attempt}/{self.max_call_attempts}: {e}")
-                if attempt < self.max_call_attempts:
-                    sleep(self.seconds_between_retries)
-        logging.error(error)
+                failure = str(e)
+                delay = self._backoff_delay(attempt)
+
+            logger.warning(f"Failure {attempt}/{self.max_call_attempts}: {failure}")
+            if attempt < self.max_call_attempts:
+                sleep(delay)
+        logger.error(f"Giving up after {self.max_call_attempts} attempts: {failure}")
         raise error
 
     def get(self, endpoint, data=None, **kwargs):
@@ -189,6 +278,7 @@ class ApiConnector:
         return self._process_request(self._session.get,
                                      f"{self.api_url}/{endpoint}",
                                      data=data,
+                                     verb='get',
                                      **kwargs)
 
     def post(self, endpoint, data=None, **kwargs):
@@ -203,6 +293,7 @@ class ApiConnector:
         return self._process_request(self._session.post,
                                      f"{self.api_url}/{endpoint}",
                                      data=data,
+                                     verb='post',
                                      **kwargs)
 
     def patch(self, endpoint, data=None, **kwargs):
@@ -217,6 +308,7 @@ class ApiConnector:
         return self._process_request(self._session.patch,
                                      f"{self.api_url}/{endpoint}",
                                      data=data,
+                                     verb='patch',
                                      **kwargs)
 
     def put(self, endpoint, data=None, **kwargs):
@@ -231,6 +323,7 @@ class ApiConnector:
         return self._process_request(self._session.put,
                                      f"{self.api_url}/{endpoint}",
                                      data=data,
+                                     verb='put',
                                      **kwargs)
 
     def delete(self, endpoint, data=None, **kwargs):
@@ -245,6 +338,7 @@ class ApiConnector:
         return self._process_request(self._session.delete,
                                      f"{self.api_url}/{endpoint}",
                                      data=data,
+                                     verb='delete',
                                      **kwargs)
 
     def push_data(self, body, operation_id: str=None, operation_timeout_sec: int=None):
@@ -267,6 +361,7 @@ class ApiConnector:
         return self._process_request(self._session.post,
                                      self.push_url,
                                      body,
+                                     verb='post',
                                      **params)
 
     def push_dataframe_data(self, df, **kwargs):

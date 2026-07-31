@@ -9,6 +9,13 @@ You first need to create an instance of the ApiConnector class with following pa
 *ATTENTION:* this package can only be used from Data Hub version 7.0 (July 1, 2025) onward, as it uses the authentication to the the new technology (Keycloak).
 For previous versions, the opinum-api-connector package must be used (https://github.com/opinum/opinum-api-connector) instead.
 
+*VERSION 1.4*
+Retry release.
+* Server-side failures are now retried instead of being raised on the first attempt. Until now only connection errors and read timeouts were, while `raise_for_status()` turns a 500 into an HTTPError that no clause caught, so a single transient failure aborted the call. See the new _retry_on_status_ and _retry_unsafe_methods_ parameters.
+* The wait between two attempts now doubles each time, capped at 60 seconds, with a small jitter so that the threads sharing an instance stop retrying in lockstep. A _Retry-After_ response header is honoured.
+* Retry and failure logs now name the method, the URL and the beginning of the response body, where the API states the actual cause. It was discarded before.
+* The module no longer calls `logging.basicConfig()` nor changes the root logger level, which reset the logging an application had already configured for itself.
+
 *VERSION 1.3*
 Sturdiness and correctness release.
 * The token lifetime now follows the real expiry returned by the authentication server (with a 120 seconds safety margin) instead of a fixed 3 minutes limit, and is renewed with its refresh token when possible.
@@ -51,12 +58,35 @@ Improved sturdiness. Added thread lock on token requests, and a default timeout 
 
 > _retries_when_connection_failure_
 > > number of extra attempts when no 200 or 204 return code (default: 0, maximum: 5)
+> >
+> > the wait between two attempts doubles each time (_seconds_between_retries_, then
+> > twice that, and so on, capped at 60 seconds) and carries a small random jitter,
+> > so that several threads sharing the instance do not all retry at the very same
+> > moment. A _Retry-After_ response header takes precedence over that wait.
 
 > _request_timeout_
 > > timeout value in seconds on all requests (including fetch token) (default: 10)
 
+> _retry_on_status_
+> > HTTP statuses retried instead of being raised straight away
+> > (default: 429, 500, 502, 503, 504)
+> >
+> > 501 is absent on purpose, and so are the 4xx other than 429: they would fail
+> > identically on a second attempt. Pass `None` to disable status retries.
+
+> _retry_unsafe_methods_
+> > also apply _retry_on_status_ to post, put, patch and delete (default: `False`)
+> >
+> > by default only get is retried on those statuses. Replaying a call that changes
+> > something, when the server may have applied it before failing, would duplicate
+> > the change. Set this to `True` when your write calls are safe to replay, or when
+> > the call only reads despite being a post (the query-by-body `POST /data` is one).
+
 > _log_level_
 > > sets log level for the module (default: INFO)
+> >
+> > only this package's logger is touched; the root logger of the calling
+> > application is left as that application configured it
 
 > _pool_size_
 > > size of the connection pool shared by all calls of the instance (default: 32)
