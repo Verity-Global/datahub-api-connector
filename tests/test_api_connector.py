@@ -5,6 +5,7 @@ No network is involved: OAuth2Session is replaced by a mock, and the connector's
 session verbs are replaced by recorders. ApiConnector fetches a token in its
 constructor, so the OAuth2Session mock is needed by every test.
 """
+import base64
 import datetime as dt
 import json
 import logging
@@ -30,6 +31,12 @@ def make_token(expires_in=3600, access_token='access-0', refresh_token='refresh-
     return {'access_token': access_token,
             'refresh_token': refresh_token,
             'expires_at': dt.datetime.now().timestamp() + expires_in}
+
+
+def make_jwt(claims):
+    """A JWT-shaped access token. Only its payload matters, the signature is never verified."""
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode('utf-8')).decode('utf-8').rstrip('=')
+    return f"header.{payload}.signature"
 
 
 class FakeResponse:
@@ -396,6 +403,69 @@ def test_valid_token_is_not_renewed(oauth_session, connector):
 
     oauth_session.return_value.fetch_token.assert_not_called()
     oauth_session.return_value.refresh_token.assert_not_called()
+
+
+def test_the_account_is_sent_again_on_a_refresh(oauth_session):
+    """A refresh that omits the account could come back scoped to another one."""
+    connector = ApiConnector(environment=ENVIRONMENT, account_id=1371)
+    connector.token = make_token(expires_in=-1)
+
+    connector._headers
+
+    assert oauth_session.return_value.refresh_token.call_args.kwargs['account'] == 1371
+
+
+def test_no_account_is_sent_on_a_refresh_when_the_connector_has_none(oauth_session):
+    connector = ApiConnector(environment=ENVIRONMENT)
+    connector.token = make_token(expires_in=-1)
+
+    connector._headers
+
+    assert 'account' not in oauth_session.return_value.refresh_token.call_args.kwargs
+
+
+def test_a_refreshed_token_scoped_to_another_account_is_reissued(oauth_session, caplog):
+    connector = ApiConnector(environment=ENVIRONMENT, account_id=1371)
+    oauth_session.return_value.refresh_token.return_value = \
+        make_token(access_token=make_jwt({'account': 1370}))
+    oauth_session.return_value.fetch_token.return_value = \
+        make_token(access_token=make_jwt({'account': 1371}))
+    connector.token = make_token(expires_in=-1)
+
+    with caplog.at_level(logging.WARNING, logger='datahub_api_connector'):
+        connector._headers
+
+    assert connector.token_account_id == 1371
+    assert 'scoped to account 1370 instead of 1371' in caplog.text
+
+
+def test_a_refreshed_token_without_a_readable_account_is_kept(oauth_session):
+    """An opaque token is undiagnosable, not wrong, and must not cost a re-issue."""
+    connector = ApiConnector(environment=ENVIRONMENT, account_id=1371)
+    oauth_session.return_value.fetch_token.reset_mock()
+    connector.token = make_token(expires_in=-1)
+
+    assert connector._headers['Authorization'] == 'Bearer access-refreshed'
+    oauth_session.return_value.fetch_token.assert_not_called()
+
+
+@pytest.mark.parametrize('claims, expected', [({'account': 1371}, 1371),
+                                              ({'accountId': '1371'}, 1371),
+                                              ({'account_id': 1371}, 1371),
+                                              ({'account': 'all'}, 'all'),
+                                              ({'sub': 'user'}, None)])
+def test_token_account_id_reads_the_account_claim(connector, claims, expected):
+    connector.token = make_token(access_token=make_jwt(claims))
+
+    assert connector.token_account_id == expected
+
+
+@pytest.mark.parametrize('access_token', ['opaque', '', 'header.!!!.signature'])
+def test_an_unreadable_token_has_no_claims_instead_of_raising(connector, access_token):
+    connector.token = make_token(access_token=access_token)
+
+    assert connector.token_claims == dict()
+    assert connector.token_account_id is None
 
 
 def test_push_data_sends_both_operation_parameters(connector):

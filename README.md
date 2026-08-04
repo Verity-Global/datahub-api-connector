@@ -9,6 +9,12 @@ You first need to create an instance of the ApiConnector class with following pa
 *ATTENTION:* this package can only be used from Data Hub version 7.0 (July 1, 2025) onward, as it uses the authentication to the the new technology (Keycloak).
 For previous versions, the opinum-api-connector package must be used (https://github.com/opinum/opinum-api-connector) instead.
 
+*VERSION 1.5*
+Account scoping fix.
+* A token renewed with its refresh token now sends the _account_id_ again. It was only sent on the first token request, so a token renewed in the middle of a run could come back scoped to another tenant: the calls then read and wrote the wrong account's data with a token that looked perfectly valid.
+* As a safety net, a renewed token that claims another account than _account_id_ is discarded and a brand new token is requested.
+* New _token_claims_ and _token_account_id_ properties, to check which account the current token is really scoped to.
+
 *VERSION 1.4*
 Retry release.
 * Server-side failures are now retried instead of being raised on the first attempt. Until now only connection errors and read timeouts were, while `raise_for_status()` turns a 500 into an HTTPError that no clause caught, so a single transient failure aborted the call. See the new _retry_on_status_ and _retry_unsafe_methods_ parameters.
@@ -55,6 +61,10 @@ Improved sturdiness. Added thread lock on token requests, and a default timeout 
 
 > _account_id_
 > > one of the tenant ids available for the Data Hub user (default: `None`)
+> >
+> > it is sent on every token request, including renewals, so an instance stays on
+> > its tenant for its whole lifetime. _token_account_id_ tells which account the
+> > current token claims to be scoped to (`None` when the token does not say).
 
 > _retries_when_connection_failure_
 > > number of extra attempts when no 200 or 204 return code (default: 0, maximum: 5)

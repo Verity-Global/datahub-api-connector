@@ -1,4 +1,5 @@
 import os
+import base64
 from oauthlib.oauth2 import LegacyApplicationClient
 from requests_oauthlib import OAuth2Session
 import json
@@ -37,6 +38,10 @@ RESPONSE_BODY_LOG_LENGTH = 200
 
 # Methods that can be replayed without risk of applying a change twice.
 IDEMPOTENT_VERBS = frozenset({'get'})
+
+# Claims an access token may carry the account it is scoped to under. Read in
+# this order, so a token using several of them yields a stable answer.
+ACCOUNT_CLAIM_NAMES = ('account', 'accountId', 'account_id')
 
 
 class ApiConnector:
@@ -125,10 +130,62 @@ class ApiConnector:
         """Renew the current token with its refresh token. The caller must hold self._token_lock."""
         oauth = OAuth2Session(client=LegacyApplicationClient(client_id=self.client_id),
                               token=self.token)
+        # The account must be sent again: a refresh grant that omits it can come
+        # back scoped to another account than the one this connector works on,
+        # and the caller would then read and write the wrong tenant's data with a
+        # token that otherwise looks perfectly valid.
+        account_args = {'account': self.account_id} if self.account_id is not None else dict()
         self.token = oauth.refresh_token(self.auth_url,
                                          client_id=self.client_id,
                                          client_secret=self.client_secret,
-                                         timeout=self.request_timeout)
+                                         timeout=self.request_timeout,
+                                         **account_args)
+
+    @property
+    def token_claims(self) -> dict:
+        """
+        Payload of the current access token, or an empty dictionary when it cannot be read.
+
+        The signature is not verified: this is our own token, obtained over TLS,
+        and the claims are only used for diagnostics.
+        """
+        access_token = self.token.get('access_token') if self.token else None
+        if not access_token:
+            return dict()
+        try:
+            payload = access_token.split('.')[1]
+            # base64url without its padding, which b64decode requires.
+            payload += '=' * (-len(payload) % 4)
+            return json.loads(base64.urlsafe_b64decode(payload).decode('utf-8'))
+        except Exception:
+            # An opaque or malformed token is not an error here, just undiagnosable.
+            return dict()
+
+    @property
+    def token_account_id(self):
+        """
+        The account the current token is scoped to, as claimed by the token itself.
+
+        None when the claim is absent, which is also the case for a token issued
+        without an account. Useful to check that a call really is going to hit
+        the account the connector was built for.
+        """
+        claims = self.token_claims
+        for name in ACCOUNT_CLAIM_NAMES:
+            if name in claims:
+                value = claims[name]
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return value
+        return None
+
+    def _token_is_scoped_to_another_account(self):
+        """True only when the token positively claims an account other than ours."""
+        if self.account_id is None:
+            return False
+        token_account_id = self.token_account_id
+        return token_account_id is not None and token_account_id != self.account_id
 
     def _token_expired(self):
         expires_at = self.token.get('expires_at') if self.token else None
@@ -147,7 +204,14 @@ class ApiConnector:
             if self.token and self.token.get('refresh_token'):
                 try:
                     self._refresh_token()
-                    return
+                    # A server that ignores the account of a refresh grant would
+                    # hand back a valid token on the wrong tenant. Rather than
+                    # trust it, fall through to a full re-issue, which always
+                    # carries the account.
+                    if not self._token_is_scoped_to_another_account():
+                        return
+                    logger.warning(f"Refreshed token is scoped to account {self.token_account_id} "
+                                   f"instead of {self.account_id}, requesting a new one")
                 except Exception:
                     logger.warning("Token refresh failed, falling back to a full reissue", exc_info=True)
             self._set_token()
