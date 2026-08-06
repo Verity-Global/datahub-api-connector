@@ -9,6 +9,17 @@ You first need to create an instance of the ApiConnector class with following pa
 *ATTENTION:* this package can only be used from Data Hub version 7.0 (July 1, 2025) onward, as it uses the authentication to the the new technology (Keycloak).
 For previous versions, the opinum-api-connector package must be used (https://github.com/opinum/opinum-api-connector) instead.
 
+*VERSION 1.6*
+Retry hardening release. The retries of 1.4 were reachable only when _retries_when_connection_failure_ was set, and several failures escaped them entirely.
+* **Retries are now on by default** (3 extra attempts). _retry_on_status_ was configured out of the box but unreachable: the default attempt budget was a single attempt, so a transient 500 on a get was raised without ever being retried. Pass `retries_when_connection_failure=0` for the previous behaviour.
+* A failure of the authentication server no longer aborts the call before a single attempt. The authentication library parses the token response without checking its status first, so a 5xx or a gateway's error page reached the caller as an oauthlib error that no clause caught. Those are now retried; a rejected credential or scope is still raised at once.
+* A transient authentication failure no longer makes the constructor raise.
+* A token the server refuses with a 401, although it still looked valid on this side (revoked, clock skew, account switched server-side), is now renewed once and the call replayed. It used to fail for good.
+* Assigning a new _account_id_ on an existing instance now takes effect immediately. The token of the previous tenant stayed in use until it expired, so up to an hour of calls read and wrote the wrong account. A token claiming another account than _account_id_ is never sent.
+* An authentication outage no longer becomes a stampede: the threads sharing an instance used to ask for a refresh and a full re-issue each, on every one of their attempts (16 threads produced 128 token requests, now 2). A thread retrying after its own backoff is never suppressed.
+* 408 and 425 joined the retried statuses, and a response cut short or with a corrupt encoding (_ChunkedEncodingError_, _ContentDecodingError_) is retried instead of raised: neither derives from requests' _HTTPError_, so both fell through every clause.
+* multi_thread_request_on_path no longer discards the calls of a group that already succeeded when one of them fails. They are yielded first, then the failure is raised. See the new _raise_on_error_ parameter to keep going instead.
+
 *VERSION 1.5*
 Account scoping fix.
 * A token renewed with its refresh token now sends the _account_id_ again. It was only sent on the first token request, so a token renewed in the middle of a run could come back scoped to another tenant: the calls then read and wrote the wrong account's data with a token that looked perfectly valid.
@@ -65,24 +76,42 @@ Improved sturdiness. Added thread lock on token requests, and a default timeout 
 > > it is sent on every token request, including renewals, so an instance stays on
 > > its tenant for its whole lifetime. _token_account_id_ tells which account the
 > > current token claims to be scoped to (`None` when the token does not say).
+> >
+> > it can also be assigned on an existing instance to switch tenant. The current
+> > token belongs to the previous one, so it is dropped and the next call gets a
+> > token for the new account. A token claiming an account other than this one is
+> > never sent.
 
 > _retries_when_connection_failure_
-> > number of extra attempts when no 200 or 204 return code (default: 0, maximum: 5)
+> > number of extra attempts when no 200 or 204 return code (default: 3, maximum: 5)
+> >
+> > pass 0 for a single attempt, which was the default until 1.6. Note that a
+> > connection failure or a timeout is retried whatever the method is, unlike the
+> > statuses of _retry_on_status_: that is what this parameter has always meant,
+> > and push_data relies on it.
 > >
 > > the wait between two attempts doubles each time (_seconds_between_retries_, then
 > > twice that, and so on, capped at 60 seconds) and carries a small random jitter,
 > > so that several threads sharing the instance do not all retry at the very same
 > > moment. A _Retry-After_ response header takes precedence over that wait.
+> >
+> > a failure of the authentication server counts as a transient failure too, since
+> > getting a token has no effect on the resource. A rejected credential or scope is
+> > raised straight away. A call refused with a 401 is a case apart: the token is
+> > renewed and the call replayed once, without using up one of these attempts.
 
 > _request_timeout_
 > > timeout value in seconds on all requests (including fetch token) (default: 10)
 
 > _retry_on_status_
 > > HTTP statuses retried instead of being raised straight away
-> > (default: 429, 500, 502, 503, 504)
+> > (default: 408, 425, 429, 500, 502, 503, 504)
 > >
-> > 501 is absent on purpose, and so are the 4xx other than 429: they would fail
-> > identically on a second attempt. Pass `None` to disable status retries.
+> > 501 is absent on purpose, and so are the 4xx other than those listed: they would
+> > fail identically on a second attempt. Pass `None` to disable status retries.
+> >
+> > 401 is not part of this and cannot be: it is handled apart, by renewing the
+> > token and replaying the call once.
 
 > _retry_unsafe_methods_
 > > also apply _retry_on_status_ to post, put, patch and delete (default: `False`)
@@ -123,3 +152,8 @@ There are two other class methods for data pushing because we have another API f
 
 There is a little bit of magic with the method multi_thread_request_on_path that splits a list of parameters
 Allowing to make parallel calls.
+
+The calls are run in groups (_max_futures_). When one of them fails, the ones of its group that
+already succeeded are yielded first, then the failure is raised, so the work the API has already
+done is not thrown away. Pass `raise_on_error=False` to get everything that worked and have the
+failures logged only.

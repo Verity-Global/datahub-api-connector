@@ -6,17 +6,26 @@ session verbs are replaced by recorders. ApiConnector fetches a token in its
 constructor, so the OAuth2Session mock is needed by every test.
 """
 import base64
+import concurrent.futures
 import datetime as dt
+import itertools
 import json
 import logging
 import threading
+import time
 from unittest import mock
 
 import pytest
 import requests
+from oauthlib.oauth2 import InvalidGrantError, MissingTokenError
 
 import datahub_api_connector as dac
 from datahub_api_connector import ApiConnector, multi_thread_request_on_path
+
+
+def _raise(error):
+    """Raises from inside a lambda, to script a mock that fails every time."""
+    raise error
 
 
 ENVIRONMENT = {
@@ -145,6 +154,56 @@ def test_server_error_is_retried_on_get(oauth_session, no_sleep):
     assert len(recorder.calls) == 2
 
 
+@pytest.mark.parametrize('status', sorted(dac.DEFAULT_RETRY_STATUSES))
+def test_every_default_status_is_retried_on_a_plain_connector(oauth_session, no_sleep, status):
+    """retry_on_status used to be unreachable: the default attempt budget was 1,
+    so a GET 500 was raised without ever being retried."""
+    connector = ApiConnector(environment=ENVIRONMENT)
+    recorder = Recorder([FakeResponse(status), FakeResponse()])
+    connector._session.get = recorder
+
+    assert connector.get('sources').status_code == 200
+    assert len(recorder.calls) == 2
+
+
+def test_no_retry_is_still_available_explicitly(oauth_session, no_sleep):
+    """0 must keep meaning one attempt; only an unset value gets the default."""
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=0)
+    recorder = Recorder([FakeResponse(500), FakeResponse()])
+    connector._session.get = recorder
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        connector.get('sources')
+
+    assert connector.max_call_attempts == 1
+    assert len(recorder.calls) == 1
+
+
+@pytest.mark.parametrize('failure', [requests.exceptions.ChunkedEncodingError('truncated'),
+                                     requests.exceptions.ContentDecodingError('corrupt gzip')],
+                         ids=['chunked_encoding', 'content_decoding'])
+def test_a_read_cut_short_is_retried(oauth_session, no_sleep, failure):
+    """Neither derives from requests' HTTPError, so both fell through every clause."""
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=1)
+    recorder = Recorder([failure, FakeResponse()])
+    connector._session.get = recorder
+
+    assert connector.get('sources').status_code == 200
+    assert len(recorder.calls) == 2
+
+
+def test_a_timeout_is_retried_on_a_write_without_opting_in(oauth_session, no_sleep):
+    """Deliberate asymmetry with the status retries: a ReadTimeout may well have
+    been applied by the server, but this is what retries_when_connection_failure
+    has always meant and push_data relies on it."""
+    connector = ApiConnector(environment=ENVIRONMENT, retry_unsafe_methods=False)
+    recorder = Recorder([requests.exceptions.ReadTimeout('slow'), FakeResponse()])
+    connector._session.post = recorder
+
+    assert connector.post('data', data={'VariableIds': [1]}).status_code == 200
+    assert len(recorder.calls) == 2
+
+
 def test_server_error_raises_once_the_retries_are_exhausted(oauth_session, no_sleep):
     connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=1)
     recorder = Recorder([FakeResponse(500), FakeResponse(503)])
@@ -157,9 +216,10 @@ def test_server_error_raises_once_the_retries_are_exhausted(oauth_session, no_sl
     assert len(recorder.calls) == 2
 
 
-@pytest.mark.parametrize('status', [400, 401, 403, 404, 409, 501])
+@pytest.mark.parametrize('status', [400, 403, 404, 409, 501])
 def test_client_error_and_permanent_failure_are_not_retried(oauth_session, no_sleep, status):
-    """They would fail identically on a second attempt. 501 is permanent too."""
+    """They would fail identically on a second attempt. 501 is permanent too.
+    401 is handled apart: it is replayed once with a new token."""
     connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=3)
     recorder = Recorder([FakeResponse(status), FakeResponse()])
     connector._session.get = recorder
@@ -332,6 +392,245 @@ def test_headers_are_rebuilt_on_each_attempt(oauth_session, no_sleep):
     connector.get('sources')
 
     assert seen == ['Bearer access-0', 'Bearer access-1']
+
+
+def test_an_auth_server_hiccup_is_retried_instead_of_aborting_the_call(oauth_session, no_sleep):
+    """requests_oauthlib never checks the status before parsing, so a 5xx of the
+    auth server reaches us as MissingTokenError. Deriving from Exception and not
+    from RequestException, it escaped both except clauses and killed the GET
+    before a single HTTP attempt."""
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=2)
+    connector.token = make_token(expires_in=-1)
+    oauth_session.return_value.refresh_token.side_effect = [MissingTokenError(),
+                                                           make_token(access_token='access-1')]
+    oauth_session.return_value.fetch_token.side_effect = MissingTokenError()
+    recorder = Recorder()
+    connector._session.get = recorder
+
+    assert connector.get('sources').status_code == 200
+    assert recorder.calls[0]['headers']['Authorization'] == 'Bearer access-1'
+
+
+def test_a_rejected_credential_is_not_retried(oauth_session, no_sleep):
+    """oauthlib reports status_code 400 on nearly every error, so the type is the
+    only usable discriminator between a dead server and a wrong password."""
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=3)
+    connector.token = make_token(expires_in=-1)
+    oauth_session.return_value.refresh_token.side_effect = InvalidGrantError()
+    oauth_session.return_value.fetch_token.side_effect = InvalidGrantError()
+    recorder = Recorder()
+    connector._session.get = recorder
+
+    with pytest.raises(InvalidGrantError):
+        connector.get('sources')
+
+    assert recorder.calls == list()
+    assert no_sleep == list()
+
+
+def test_an_unparseable_auth_response_is_reported_as_a_token_error(oauth_session, no_sleep):
+    """A gateway's HTML error page comes out of the auth library as a ValueError."""
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=1)
+    connector.token = make_token(expires_in=-1)
+    oauth_session.return_value.refresh_token.side_effect = \
+        ValueError('Error trying to decode a non urlencoded string')
+    oauth_session.return_value.fetch_token.side_effect = \
+        ValueError('Error trying to decode a non urlencoded string')
+
+    with pytest.raises(MissingTokenError):
+        connector.get('sources')
+
+
+def test_a_transient_auth_failure_does_not_fail_the_constructor(oauth_session, no_sleep):
+    """The constructor used to die on the very blip every other call retries."""
+    oauth_session.return_value.fetch_token.side_effect = [
+        requests.exceptions.ConnectionError('auth down'),
+        make_token(access_token='access-late'),
+    ]
+
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=2)
+
+    assert connector.token['access_token'] == 'access-late'
+
+
+def test_a_rejected_credential_still_fails_the_constructor(oauth_session, no_sleep):
+    oauth_session.return_value.fetch_token.side_effect = InvalidGrantError()
+
+    with pytest.raises(InvalidGrantError):
+        ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=3)
+
+    assert oauth_session.return_value.fetch_token.call_count == 1
+
+
+def test_an_auth_outage_does_not_become_a_stampede(oauth_session, no_sleep):
+    """Sixteen threads sharing a connector produced a hundred and twenty-eight
+    token requests, each retrying a refresh and a full re-issue on every attempt.
+    A thread that finds a renewal has completed while it queued reuses its failure."""
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=0)
+    connector.token = make_token(expires_in=-1)
+    calls = list()
+    counting = threading.Lock()
+    together = threading.Barrier(16)
+
+    def dead_auth(*args, **kwargs):
+        with counting:
+            calls.append(1)
+        # Still in flight while the other threads queue on the token lock.
+        time.sleep(0.05)
+        raise requests.exceptions.ConnectionError('auth down')
+
+    oauth_session.return_value.refresh_token.side_effect = dead_auth
+    oauth_session.return_value.fetch_token.side_effect = dead_auth
+    connector._session.get = lambda url, **kwargs: FakeResponse()
+
+    def call():
+        together.wait()
+        return connector.get('sources')
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        futures = [executor.submit(call) for _ in range(16)]
+        failed = [future for future in futures if future.exception() is not None]
+
+    assert len(failed) == 16
+    # One renewal for the whole burst: a refresh, then the full re-issue it falls
+    # back to. Sixteen threads used to make sixteen of each.
+    assert len(calls) == 2, f"{len(calls)} token requests for one burst of 16 threads"
+
+
+def test_a_thread_retrying_in_sequence_is_never_suppressed(oauth_session, no_sleep):
+    """The stampede guard must collapse simultaneous duplicates only. A thread
+    coming back after its backoff has to get a real attempt, otherwise its retries
+    are silently eaten."""
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=3)
+    connector.token = make_token(expires_in=-1)
+    counter = itertools.count()
+    dead_auth = lambda *a, **k: (next(counter),
+                                 _raise(requests.exceptions.ConnectionError('auth down')))
+    oauth_session.return_value.refresh_token.side_effect = dead_auth
+    oauth_session.return_value.fetch_token.side_effect = dead_auth
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        connector.get('sources')
+
+    # A refresh and a re-issue on each of the 4 attempts: none was suppressed.
+    assert next(counter) == 8
+    assert len(no_sleep) == 3
+
+
+def test_a_token_refused_by_the_server_is_renewed_and_the_call_replayed(oauth_session, no_sleep):
+    """A revoked token, clock skew, or an account switched server-side: it looks
+    perfectly valid here, so nothing used to renew it and the call failed for good."""
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=0)
+    oauth_session.return_value.fetch_token.return_value = make_token(access_token='access-1')
+    recorder = Recorder([FakeResponse(401), FakeResponse()])
+    connector._session.get = recorder
+
+    assert connector.get('sources').status_code == 200
+    seen = [call['headers']['Authorization'] for call in recorder.calls]
+    assert seen == ['Bearer access-0', 'Bearer access-1']
+    # The replay must not eat one of the caller's attempts.
+    assert no_sleep == list()
+
+
+@pytest.mark.parametrize('verb', ['get', 'post', 'put', 'patch', 'delete'])
+def test_the_replay_after_a_401_happens_on_every_verb(oauth_session, no_sleep, verb):
+    """A 401 means the request was refused before being applied, so replaying it
+    is safe even for a write and does not need retry_unsafe_methods."""
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=0)
+    recorder = Recorder([FakeResponse(401), FakeResponse()])
+    setattr(connector._session, verb, recorder)
+
+    assert getattr(connector, verb)('sources').status_code == 200
+    assert len(recorder.calls) == 2
+
+
+def test_a_second_401_is_raised(oauth_session, no_sleep):
+    """Otherwise a genuinely revoked account would loop on the auth server."""
+    connector = ApiConnector(environment=ENVIRONMENT, retries_when_connection_failure=3)
+    recorder = Recorder([FakeResponse(401), FakeResponse(401), FakeResponse()])
+    connector._session.get = recorder
+
+    with pytest.raises(requests.exceptions.HTTPError) as raised:
+        connector.get('sources')
+
+    assert raised.value.response.status_code == 401
+    assert len(recorder.calls) == 2
+
+
+def test_changing_the_account_id_issues_a_token_for_it(oauth_session, no_sleep):
+    """The token stayed cached until it expired, so up to an hour of calls read
+    and wrote the previous tenant."""
+    connector = ApiConnector(environment=ENVIRONMENT, account_id=1371)
+    oauth_session.return_value.fetch_token.return_value = \
+        make_token(access_token=make_jwt({'account': 1372}))
+    recorder = Recorder()
+    connector._session.get = recorder
+
+    connector.account_id = 1372
+    connector.get('sources')
+
+    assert connector.token_account_id == 1372
+    assert oauth_session.return_value.fetch_token.call_args.kwargs['account'] == 1372
+
+
+def test_reassigning_the_same_account_id_keeps_the_token(oauth_session):
+    connector = ApiConnector(environment=ENVIRONMENT, account_id=1371)
+    oauth_session.return_value.fetch_token.reset_mock()
+
+    connector.account_id = 1371
+
+    connector._headers
+    oauth_session.return_value.fetch_token.assert_not_called()
+
+
+def test_a_token_carrying_another_account_is_never_sent(oauth_session, no_sleep):
+    """_token_is_scoped_to_another_account() was only consulted after a refresh,
+    never on the path a valid-looking token takes."""
+    connector = ApiConnector(environment=ENVIRONMENT, account_id=1371)
+    connector.token = make_token(access_token=make_jwt({'account': 1370}),
+                                 refresh_token=None)
+    oauth_session.return_value.fetch_token.return_value = \
+        make_token(access_token=make_jwt({'account': 1371}))
+
+    connector._headers
+
+    assert connector.token_account_id == 1371
+
+
+def test_a_reissued_token_on_the_wrong_account_is_reported_and_does_not_loop(oauth_session, caplog):
+    """Nothing is left to try, so re-issuing on every call would only hammer the
+    auth server."""
+    connector = ApiConnector(environment=ENVIRONMENT, account_id=1371)
+    oauth_session.return_value.refresh_token.return_value = \
+        make_token(access_token=make_jwt({'account': 1370}))
+    oauth_session.return_value.fetch_token.return_value = \
+        make_token(access_token=make_jwt({'account': 1370}))
+    connector.token = make_token(expires_in=-1)
+
+    with caplog.at_level(logging.ERROR, logger='datahub_api_connector'):
+        connector._headers
+    oauth_session.return_value.fetch_token.reset_mock()
+    connector._headers
+    connector._headers
+
+    assert 'Newly issued token is scoped to account 1370 instead of 1371' in caplog.text
+    oauth_session.return_value.fetch_token.assert_not_called()
+
+
+def test_the_claims_are_decoded_once_per_token(connector, monkeypatch):
+    """They are now read on every request, to catch a changed account_id."""
+    decoded = list()
+    original = ApiConnector._decode_claims
+
+    def counting_decode(access_token):
+        decoded.append(access_token)
+        return original(access_token)
+
+    monkeypatch.setattr(ApiConnector, '_decode_claims', staticmethod(counting_decode))
+    connector.token = make_token(access_token=make_jwt({'account': 1371}))
+
+    assert [connector.token_account_id for _ in range(5)] == [1371] * 5
+    assert len(decoded) == 1
 
 
 def test_parameters_are_mapped_to_query_and_headers(connector):
@@ -550,6 +849,44 @@ def test_multi_thread_propagates_failures(no_sleep):
 
     with pytest.raises(requests.exceptions.ConnectionError):
         list(generator)
+
+
+def _get_failing_on_zero(endpoint, **kwargs):
+    if 0 in kwargs['sourceId']:
+        raise requests.exceptions.HTTPError('404')
+    return kwargs['sourceId']
+
+
+def test_multi_thread_yields_the_successful_calls_before_raising():
+    """The first failure used to abort the whole group, throwing away the calls
+    the API had already answered."""
+    generator = multi_thread_request_on_path(_get_failing_on_zero, 'data',
+                                             split_parameter='sourceId',
+                                             max_parameter_entities=1,
+                                             max_futures=8, workers=8,
+                                             sourceId=list(range(8)))
+
+    yielded = list()
+    with pytest.raises(requests.exceptions.HTTPError):
+        for result in generator:
+            yielded.append(result)
+
+    assert sorted(yielded) == [[entity] for entity in range(1, 8)]
+
+
+def test_multi_thread_can_keep_going_after_a_failure(caplog):
+    generator = multi_thread_request_on_path(_get_failing_on_zero, 'data',
+                                             split_parameter='sourceId',
+                                             max_parameter_entities=1,
+                                             max_futures=8, workers=8,
+                                             raise_on_error=False,
+                                             sourceId=list(range(8)))
+
+    with caplog.at_level(logging.WARNING, logger='datahub_api_connector'):
+        yielded = list(generator)
+
+    assert sorted(yielded) == [[entity] for entity in range(1, 8)]
+    assert 'A call failed in a group of 8' in caplog.text
 
 
 def test_session_is_pooled_and_blocking(connector):
