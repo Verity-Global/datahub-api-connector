@@ -77,6 +77,11 @@ class Recorder:
 @pytest.fixture
 def oauth_session():
     with mock.patch.object(dac, 'OAuth2Session') as factory:
+        # The connector uses the session as a context manager, to close it. A
+        # real Session returns itself from __enter__, so the mock must too:
+        # otherwise the scripted token lands on the factory's return value while
+        # the code under test talks to whatever __enter__ handed back.
+        factory.return_value.__enter__.return_value = factory.return_value
         factory.return_value.fetch_token.return_value = make_token()
         factory.return_value.refresh_token.return_value = make_token(access_token='access-refreshed')
         yield factory
@@ -895,3 +900,48 @@ def test_session_is_pooled_and_blocking(connector):
     assert adapter._pool_block is True
     assert adapter._pool_maxsize == ApiConnector.DEFAULT_POOL_SIZE
     assert adapter.max_retries.total == 0
+
+
+def test_the_auth_session_of_a_token_request_is_closed(oauth_session):
+    """One OAuth2Session was left open per token request, holding a connection to
+    the auth server until the garbage collector got to it."""
+    ApiConnector(environment=ENVIRONMENT)
+
+    oauth_session.return_value.__exit__.assert_called_once()
+
+
+def test_the_auth_session_of_a_refresh_is_closed(oauth_session):
+    connector = ApiConnector(environment=ENVIRONMENT)
+    connector.token['expires_at'] = dt.datetime.now().timestamp() - 1
+    oauth_session.return_value.__exit__.reset_mock()
+
+    connector._headers
+
+    oauth_session.return_value.refresh_token.assert_called_once()
+    oauth_session.return_value.__exit__.assert_called_once()
+
+
+def test_no_auth_session_is_left_open_when_a_connector_walks_many_accounts(oauth_session, no_sleep):
+    """The usage pattern the docstring recommends: one connector reused across
+    accounts. Neither the API session nor the auth sessions may accumulate."""
+    connector = ApiConnector(environment=ENVIRONMENT, account_id=0)
+    api_session = connector._session
+    connector._session.get = Recorder()
+
+    for account_id in range(1, 26):
+        connector.account_id = account_id
+        connector.get('sources')
+
+    # One auth session per token request, each opened and closed in turn.
+    assert oauth_session.call_count == oauth_session.return_value.__exit__.call_count
+    # And a single API session throughout, rather than one per account.
+    assert connector._session is api_session
+
+    # close() must release the pool that holds the sockets. Materialised here
+    # (without connecting) so the assertion is not vacuously true.
+    adapter = api_session.get_adapter('https://api.opinum.com')
+    adapter.poolmanager.connection_from_url('https://api.opinum.com')
+    assert len(adapter.poolmanager.pools) == 1
+
+    connector.close()
+    assert len(adapter.poolmanager.pools) == 0

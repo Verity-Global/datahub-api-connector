@@ -1,0 +1,8 @@
+How to publish a module to PyPi
+
+In the Python project:
+- (init only) create a "dist" folder
+- (init only) install twince and build (pip install)
+- create the distribution package: python -m build
+- send to PyPi: python -m twine upload dist/*
+-- you need a PyPi token; it is possible to add it to .pypirc file in your $HOME folder (C:\users\xxx in Windows) so as to know have to enter it every time. See https://packaging.python.org/en/latest/specifications/pypirc/#using-a-pypi-token.

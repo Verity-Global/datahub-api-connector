@@ -9,6 +9,11 @@ You first need to create an instance of the ApiConnector class with following pa
 *ATTENTION:* this package can only be used from Data Hub version 7.0 (July 1, 2025) onward, as it uses the authentication to the the new technology (Keycloak).
 For previous versions, the opinum-api-connector package must be used (https://github.com/opinum/opinum-api-connector) instead.
 
+*VERSION 1.7*
+Connection lifetime fix, following up on the pool introduced in 1.3.
+* The authentication session of every token request is now closed. One _OAuth2Session_ is built per token request, and none of them were closed, so each held a connection to the authentication server until the garbage collector got to it. On a long run over many accounts those piled up next to the API connections.
+* Documented the lifetime of an instance, which was the missing piece: it owns a connection pool, so it is meant to be built once, reused, and closed. Building one per unit of work leaks its pool until the object is collected, and caching one per account without ever closing them exhausts the sockets the operating system can hand out (_WSAENOBUFS_ / _ERR_NO_BUFFER_SPACE_ on Windows) on a long run. To work through many accounts, reuse one instance per thread and assign _account_id_.
+
 *VERSION 1.6*
 Retry hardening release. The retries of 1.4 were reachable only when _retries_when_connection_failure_ was set, and several failures escaped them entirely.
 * **Retries are now on by default** (3 extra attempts). _retry_on_status_ was configured out of the box but unreachable: the default attempt budget was a single attempt, so a transient 500 on a get was raised without ever being retried. Pass `retries_when_connection_failure=0` for the previous behaviour.
@@ -132,6 +137,13 @@ Improved sturdiness. Added thread lock on token requests, and a default timeout 
 > >
 > > it must be at least as large as the number of threads sharing the instance
 > > (the _workers_ parameter of multi_thread_request_on_path, default: 16)
+> >
+> > because it owns that pool, an instance is meant to be long-lived: build a few,
+> > reuse them, and close them (ApiConnector is a context manager). One instance per
+> > unit of work leaks its pool until the object is collected, and a cache of them
+> > never closed runs the machine out of sockets. To work through many accounts,
+> > reuse one instance per thread and assign _account_id_ rather than building one
+> > per account
 
 Once you have your ApiConnector instance, you may use the class methods
 

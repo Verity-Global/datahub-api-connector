@@ -83,6 +83,15 @@ class ApiConnector:
     """
     A class for connection to Data Hub API
 
+    An instance owns a persistent session holding a pool of up to pool_size
+    keep-alive sockets, so it is meant to be long-lived: build a few, reuse
+    them, and close() them (or use them as context managers). Building one per
+    unit of work leaks its pool until the object is collected, and a cache of
+    them never closed exhausts the OS socket buffers (WSAENOBUFS /
+    ERR_NO_BUFFER_SPACE on Windows) on a long run. To work through many
+    accounts, reuse one connector per thread and assign account_id: the setter
+    exists for exactly that and re-scopes the token.
+
     :param environment: a dictionary with all environment variables
     :param account_id: the account id to use (for users having access to multiple tenants). Assigning a new one invalidates the current token, so the next call is made on the new account
     :param retries_when_connection_failure: allows to make several attempts to have a successful query (connection issues can happen). Defaults to DEFAULT_RETRIES; pass 0 for a single attempt
@@ -204,7 +213,6 @@ class ApiConnector:
 
     def _set_token(self):
         """Request a brand new token. The caller must hold self._token_lock."""
-        oauth = OAuth2Session(client=LegacyApplicationClient(client_id=self.client_id))
         args = {
             'token_url': f"{self.auth_url}",
             'scope': self.scope,
@@ -216,22 +224,26 @@ class ApiConnector:
         }
         if self.account_id is not None:
             args['account'] = self.account_id
-        self.token = oauth.fetch_token(**args, timeout=self.request_timeout)
+        # Closed on exit: an OAuth2Session is a requests.Session, so one left
+        # open per token request piled up connections to the auth server for as
+        # long as it took the garbage collector to notice.
+        with OAuth2Session(client=LegacyApplicationClient(client_id=self.client_id)) as oauth:
+            self.token = oauth.fetch_token(**args, timeout=self.request_timeout)
 
     def _refresh_token(self):
         """Renew the current token with its refresh token. The caller must hold self._token_lock."""
-        oauth = OAuth2Session(client=LegacyApplicationClient(client_id=self.client_id),
-                              token=self.token)
         # The account must be sent again: a refresh grant that omits it can come
         # back scoped to another account than the one this connector works on,
         # and the caller would then read and write the wrong tenant's data with a
         # token that otherwise looks perfectly valid.
         account_args = {'account': self.account_id} if self.account_id is not None else dict()
-        self.token = oauth.refresh_token(self.auth_url,
-                                         client_id=self.client_id,
-                                         client_secret=self.client_secret,
-                                         timeout=self.request_timeout,
-                                         **account_args)
+        with OAuth2Session(client=LegacyApplicationClient(client_id=self.client_id),
+                           token=self.token) as oauth:
+            self.token = oauth.refresh_token(self.auth_url,
+                                             client_id=self.client_id,
+                                             client_secret=self.client_secret,
+                                             timeout=self.request_timeout,
+                                             **account_args)
 
     @property
     def token_claims(self) -> dict:
